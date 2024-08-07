@@ -35,6 +35,32 @@ struct Metadata {
     out_dir: PathBuf,
 }
 
+impl Metadata {
+    fn is_cross_compiling(&self) -> bool {
+        self.host != self.target
+    }
+
+    fn get_triplet_env(&self, name: &str) -> Option<String> {
+        if self.is_cross_compiling() {
+            env::var(format!("{}_{}", name, self.target.replace("-", "_"))).ok()
+        } else {
+            env::var(name).ok()
+        }
+    }
+
+    fn cc(&self) -> Option<String> {
+        self.get_triplet_env("CC")
+    }
+
+    fn ar(&self) -> Option<String> {
+        self.get_triplet_env("AR")
+    }
+
+    fn ranlib(&self) -> Option<String> {
+        self.get_triplet_env("RANLIB")
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=SASL2_STATIC");
 
@@ -118,13 +144,26 @@ fn build_sasl(metadata: &Metadata) {
         configure_args.push("--disable-macos-framework".into());
     }
     if metadata.host != metadata.target {
+        configure_args.push(format!("--build={}", metadata.host));
         configure_args.push(format!("--host={}", metadata.target));
     }
-    cmd(src_dir.join("configure"), &configure_args)
+
+    let mut cmd = cmd(src_dir.join("configure"), &configure_args)
         .dir(&src_dir)
-        .env_remove("CONFIG_SITE")
-        .run()
-        .expect("configure failed");
+        .env_remove("CONFIG_SITE");
+    if let Some(cc) = metadata.cc() {
+        cmd = cmd.env("CC", cc);
+    }
+    if let Some(ar) = metadata.ar() {
+        cmd = cmd.env("AR", ar);
+    }
+    if let Some(ranlib) = metadata.ranlib() {
+        cmd = cmd.env("RANLIB", ranlib);
+    }
+    if metadata.is_cross_compiling() {
+        cmd = cmd.env("ac_cv_gssapi_supports_spnego", "yes")
+    }
+    cmd.run().expect("configure failed");
 
     let is_bsd = metadata.host.contains("dragonflybsd")
         || metadata.host.contains("freebsd")
@@ -150,11 +189,20 @@ fn build_sasl(metadata: &Metadata) {
     // `cd lib && make install`, but that Makefile is incorrectly dependent
     // on targets in `include` and `common`, so build those directories first.
     for sub_dir in &["include", "common", "lib"] {
-        cmd!(make, "install")
+        let mut make_cmd = cmd!(make, "install")
             .dir(src_dir.join(sub_dir))
-            .env("MAKEFLAGS", &make_flags)
-            .run()
-            .expect("make failed");
+            .env("SHELL", "sh -x")
+            .env("MAKEFLAGS", &make_flags);
+        if let Some(cc) = metadata.cc() {
+            make_cmd = make_cmd.env("CC", cc);
+        }
+        if let Some(ar) = metadata.ar() {
+            make_cmd = make_cmd.env("AR", ar);
+        }
+        if let Some(ranlib) = metadata.ranlib() {
+            make_cmd = make_cmd.env("RANLIB", ranlib);
+        }
+        make_cmd.run().expect("make failed");
     }
 
     validate_headers(&[install_dir.join("include")]);
